@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 執行日誌(可能含逐字稿內容,且屬本機產物)
+logs/
+*.log
+
+# 模型檔(約 16GB,首次執行會自動下載)
+models/
+
+# 私人音訊與辨識結果
+voice/
+recordings/
+output/
+
+# 作業系統 / 編輯器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.venv/

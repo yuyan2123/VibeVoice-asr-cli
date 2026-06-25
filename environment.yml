@@ -1,0 +1,25 @@
+# 便利用的 Conda 環境定義檔。
+# 若執行後 torch 被裝成 CPU 版(在 RTX 50 系列上無法使用 GPU),
+# 請改用說明中的 cu128 索引重新安裝 torch / torchaudio。
+name: vibevoice-asr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - ffmpeg
+  - xz          # 提供 liblzma.dll;預設頻道的版本在 Windows 上可能缺此 DLL 導致 librosa 匯入失敗
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch
+      - torchaudio
+      - transformers>=5.3.0
+      - accelerate>=1.0.0
+      - bitsandbytes>=0.45.0
+      - librosa>=0.10.2
+      - soundfile>=0.12.1
+      - sounddevice>=0.4.6
+      - huggingface_hub>=0.26.0
+      - numpy
+      - rich>=13.7.0
+      - psutil>=5.9.0
