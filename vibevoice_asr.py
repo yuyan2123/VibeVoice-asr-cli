@@ -645,19 +645,23 @@ def build_model(model_path, quant):
     if quant == "none":
         load_kwargs["dtype"] = torch.bfloat16
 
-    # 使用 sdpa 注意力:避免 eager 對長序列具現化 O(N^2) 的注意力矩陣而爆顯存。
-    load_kwargs["attn_implementation"] = "sdpa"
+    # 只對文字骨幹(Qwen2)啟用 sdpa;聲學/語意 tokenizer 是卷積、不支援 sdpa。
+    # 必須用 dict 精準指定子設定:若傳字串 "sdpa",transformers 會試圖把它套到「所有」
+    # 子模型,卷積 tokenizer 不支援就拋 ValueError,導致整個退回 eager。
+    # eager 會對長序列具現化 O(N^2) 的注意力矩陣(30 分鐘音訊約 13700 tokens、注意力矩陣
+    # 可達數 GB),長音訊必爆顯存;sdpa 走記憶體高效 kernel(O(N)),是長音訊不 OOM 的關鍵。
+    load_kwargs["attn_implementation"] = {"text_config": "sdpa"}
 
     ui_print(f"[bold cyan]載入模型[/bold cyan] {model_path}  [dim]量化模式: {quant}[/dim]")
     t0 = time.time()
     processor = AutoProcessor.from_pretrained(model_path)
-    active_attn = "sdpa"
+    active_attn = "sdpa(text)"
     try:
         model = VibeVoiceAsrForConditionalGeneration.from_pretrained(model_path, **load_kwargs)
     except (ValueError, TypeError) as exc:
-        ui_warning("sdpa 注意力不支援此模型，已改用預設注意力。")
+        ui_warning(f"sdpa 注意力設定失敗({exc}),改用預設(eager)注意力。")
         load_kwargs.pop("attn_implementation", None)
-        active_attn = "預設"
+        active_attn = "eager(預設)"
         model = VibeVoiceAsrForConditionalGeneration.from_pretrained(model_path, **load_kwargs)
     model.eval()
     ui_success(f"模型已載入: 裝置={model.device}, dtype={model.dtype}, 注意力={active_attn}, 耗時 {time.time() - t0:.1f}s")
@@ -769,6 +773,56 @@ def _decode_results(processor, generated_ids):
     return raw, parsed, text
 
 
+def _make_json_array_stopper(tokenizer, prompt_len):
+    """建立「頂層 JSON 轉錄陣列一收尾就停止生成」的停止條件。
+
+    模型在 4-bit 下,轉完該段 JSON 後常不穩定吐出結束符;在較高的 max_new_tokens 下會
+    一路空吐到接近上限(多吐的內容會被解析器丟掉,卻白白浪費大量時間)。此停止條件以
+    JSON 中括號深度追蹤,在頂層陣列收尾(深度歸零)時立即停止;字串內的 '['/']'
+    (例如 "[Noise]")以 in_str 狀態正確忽略。若模型始終未收尾,則維持原本 max_new_tokens
+    上限——屬純粹的提早停止,不會截斷或破壞正確性。狀態化,故每次 generate 都要重建。
+    """
+    from transformers import StoppingCriteria
+
+    class _JsonArrayStopper(StoppingCriteria):
+        def __init__(self):
+            self.depth = 0
+            self.in_str = False
+            self.esc = False
+            self.started = False
+            self.done = False
+            self.scanned = 0
+
+        def __call__(self, input_ids, scores=None, **kwargs):
+            import torch
+
+            gen = input_ids[0, prompt_len:]
+            new = gen[self.scanned:]
+            if new.numel():
+                for ch in tokenizer.decode(new, skip_special_tokens=False):
+                    if self.in_str:
+                        if self.esc:
+                            self.esc = False
+                        elif ch == "\\":
+                            self.esc = True
+                        elif ch == '"':
+                            self.in_str = False
+                        continue
+                    if ch == '"':
+                        self.in_str = True
+                    elif ch == "[":
+                        self.depth += 1
+                        self.started = True
+                    elif ch == "]":
+                        self.depth -= 1
+                        if self.started and self.depth == 0:
+                            self.done = True
+                self.scanned = gen.numel()
+            return torch.tensor([self.done], device=input_ids.device)
+
+    return _JsonArrayStopper()
+
+
 def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_NEW_TOKENS, chunk_size=None, report=True):
     """對單段音訊執行辨識,回傳 raw / parsed / text 三種結果。"""
     import torch
@@ -778,6 +832,7 @@ def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_
         request["prompt"] = prompt
 
     inputs = processor.apply_transcription_request(**request).to(model.device, model.dtype)
+    prompt_len = inputs["input_ids"].shape[1]
 
     audio_sec = len(audio) / TARGET_SR
     # max_new_tokens 視為上限,實際依音訊長度動態估算,避免長段被截斷又不浪費。
@@ -793,10 +848,16 @@ def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_
     last_oom = None
     output_ids = None
     chunk_sizes = _chunk_retry_sizes(chunk_size)
+    from transformers import StoppingCriteriaList
+
     for attempt, current_chunk_size in enumerate(chunk_sizes, start=1):
         gen_kwargs = dict(base_gen_kwargs)
         if current_chunk_size:
             gen_kwargs["acoustic_tokenizer_chunk_size"] = current_chunk_size
+        # 轉錄陣列收尾即停,避免高上限下空吐浪費時間;停止條件有狀態,每次嘗試都重建。
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
+            [_make_json_array_stopper(processor.tokenizer, prompt_len)]
+        )
 
         try:
             with torch.inference_mode():
@@ -1074,7 +1135,7 @@ class Settings:
     quant: str = "4bit"
     with_timestamps: bool = False
     prompt: str = None
-    window_seconds: float = 0.0  # 0 表示單次優先(對齊模型 60 分鐘單次設計),OOM 才退回分段
+    window_seconds: float = DEFAULT_WINDOW_SECONDS  # 超過此長度即分段;短音訊(<=600s)仍單次處理。長音訊單次在小顯存會 OOM 空轉,故預設分段
     chunk_size: int = DEFAULT_CHUNK_SIZE
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS  # 視為上限,實際依音訊長度動態估算
     preview_chars: int = 1200
