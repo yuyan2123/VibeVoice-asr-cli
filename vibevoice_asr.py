@@ -261,15 +261,15 @@ def collect_resource_stats():
     return stats
 
 
-def _resource_level_style(value):
-    """依使用率高低回傳顏色:綠 → 黃 → 紅。"""
+def _pressure_style(value):
+    """記憶體壓力配色:平時 dim 不搶眼,偏高轉黃,接近滿載轉紅(語意色只給示警)。"""
     if value is None:
         return "grey50"
     if value >= 85:
         return "red"
     if value >= 60:
         return "yellow"
-    return "green"
+    return "grey70"
 
 
 def _fmt_clock(seconds):
@@ -290,17 +290,8 @@ def _fmt_clock(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _meter(value, width, style, filled="▰", empty="▱"):
-    """資源小計量條(不含邊框與百分比),value 為 0–100 或 None。"""
-    if value is None:
-        return f"[grey35]{empty * width}[/grey35]"
-    completed = max(0.0, min(100.0, float(value)))
-    n = max(0, min(width, int(round(completed / 100 * width))))
-    return f"[{style}]{filled * n}[/{style}][grey35]{empty * (width - n)}[/grey35]"
-
-
 def _progress_bar_text(percentage, width):
-    """主進度條(實心粗筆畫,與較細的資源計量條區隔)。"""
+    """主進度條:面板上唯一的強調色塊,實心粗筆畫。"""
     completed = max(0.0, min(100.0, float(percentage or 0)))
     n = max(0, min(width, int(round(completed / 100 * width))))
     return (
@@ -309,17 +300,34 @@ def _progress_bar_text(percentage, width):
     )
 
 
-def _resource_cell(value, style, width=8):
-    """單一資源列的「邊框計量條 + 百分比」。"""
-    bar = _meter(value, width, style)
-    pct = f"[{style}]{value:>3.0f}%[/{style}]" if value is not None else "[grey50] --%[/grey50]"
-    return f"[grey42]▕[/grey42]{bar}[grey42]▏[/grey42] {pct}"
+def _resource_line(stats):
+    """資源使用率壓成一行 dim 文字(次要資訊;只有記憶體吃緊才以黃/紅示警)。"""
+
+    def cell(label, value, pressure=False):
+        if value is None:
+            return f"[grey42]{label} --[/grey42]"
+        style = _pressure_style(value) if pressure else "grey70"
+        return f"[grey50]{label}[/grey50] [{style}]{value:.0f}%[/{style}]"
+
+    line = "   ".join(
+        [
+            cell("CPU", stats.get("cpu")),
+            cell("RAM", stats.get("ram"), pressure=True),
+            cell("GPU", stats.get("gpu")),
+            cell("VRAM", stats.get("vram"), pressure=True),
+        ]
+    )
+    vram_label = stats.get("vram_label")
+    if vram_label:
+        line += f"   [grey42]{vram_label}[/grey42]"
+    return line
 
 
-def render_dashboard(task, spinner):
-    """把一個進度任務畫成雙欄儀表板:上方主進度,左欄時間/狀態,右欄資源計量。
+def render_dashboard(task, spinner, width=52):
+    """單欄、有階層的進度面板:進度條與轉錄文字為主角,時間/資源退為次要 dim 資訊。
 
-    同時支援辨識任務(kind=asr:範圍/RTF)與下載任務(kind=download:檔案)。
+    視覺階層:強調色只給「進度條」與「目前語者」;狀態用語意色(完成綠、記憶體吃緊黃/紅);
+    其餘時間、資源一律 dim。支援辨識任務(kind=asr)與下載任務(kind=download)。
     """
     fields = task.fields
     kind = fields.get("kind", "asr")
@@ -327,74 +335,55 @@ def render_dashboard(task, spinner):
     pct = task.percentage or 0.0
     elapsed = _fmt_clock(task.elapsed)
     remaining = task.time_remaining
-    remaining_text = f"約 {_fmt_clock(remaining)}" if remaining else "—"
+    stage = fields.get("stage") or ("下載中" if kind == "download" else "辨識中")
 
-    # 第一列:spinner + 主進度條 + 百分比 +(辨識才有的)段數/階段
-    head = Table.grid(padding=(0, 1))
+    # 1) 標題列:spinner + 狀態(語意色)+ 段數 ……右側 RTF(次要)
+    if stage == "完成":
+        status = "[bold green]● 完成[/bold green]"
+    else:
+        status = f"[bold bright_cyan]{stage}[/bold bright_cyan]"
+    if kind != "download" and fields.get("seg"):
+        status += f"  [grey58]段 {fields['seg']}[/grey58]"
+    rtf = fields.get("rtf")
+    rtf_text = f"[grey58]RTF {rtf:.2f}[/grey58]" if isinstance(rtf, (int, float)) and rtf == rtf else ""
+    head = Table.grid(expand=True)
     head.add_column(no_wrap=True)
-    head.add_column(no_wrap=True)
+    head.add_column(ratio=1)
     head.add_column(justify="right", no_wrap=True)
-    head.add_column(no_wrap=True)
+    head.add_row(spinner, " " + status, rtf_text)
+
+    blocks = [head]
+
+    # 2) 主進度條(面板唯一強調)+ 百分比
+    bar_w = max(12, width - 7)
+    blocks.append(_progress_bar_text(pct, bar_w) + f" [bold]{pct:>3.0f}%[/bold]")
+
+    # 3) 次要資訊列(時間 / 檔案;dim)
     if kind == "download":
-        right_label = ""
+        meta = f"檔案 {fields.get('status') or '—'}   已用 {elapsed}"
     else:
-        parts = []
-        if fields.get("seg"):
-            parts.append(f"[bold]段 {fields['seg']}[/bold]")
-        if fields.get("stage"):
-            parts.append(f"[dim]{fields['stage']}[/dim]")
-        right_label = "  ".join(parts)
-    head.add_row(spinner, _progress_bar_text(pct, 30), f"[bold]{pct:>3.0f}%[/bold]", right_label)
+        rem = f"約 {_fmt_clock(remaining)}" if remaining else "—"
+        parts = [p for p in (fields.get("span"),) if p]
+        parts.append(f"已用 {elapsed}")
+        parts.append(f"剩餘 {rem}")
+        meta = "   ".join(parts)
+    blocks.append(Text(meta, style="grey58", no_wrap=True, overflow="ellipsis"))
 
-    # 左欄:時間 / 狀態
-    left = Table.grid(padding=(0, 1))
-    left.add_column(justify="left", no_wrap=True, style="dim")
-    left.add_column(justify="left", no_wrap=True, max_width=26, overflow="ellipsis")
-    if kind == "download":
-        left.add_row("檔案", Text(fields.get("status") or "—"))
-        left.add_row("已用", elapsed)
-        left.add_row("剩餘", remaining_text)
-    else:
-        rtf = fields.get("rtf")
-        rtf_text = f"{rtf:.2f}" if isinstance(rtf, (int, float)) and rtf == rtf else "—"
-        left.add_row("範圍", fields.get("span") or "—")
-        left.add_row("已用", elapsed)
-        left.add_row("剩餘", remaining_text)
-        left.add_row("RTF", rtf_text)
-
-    if stats is None:
-        body = left
-    else:
-        # 右欄:CPU/RAM/GPU/VRAM 計量(CPU/GPU 固定色,RAM/VRAM 依壓力變色)
-        right = Table.grid(padding=(0, 1))
-        right.add_column(justify="left", no_wrap=True)
-        right.add_column(justify="left", no_wrap=True)
-        rows = [
-            ("CPU", stats.get("cpu"), "cyan"),
-            ("RAM", stats.get("ram"), _resource_level_style(stats.get("ram"))),
-            ("GPU", stats.get("gpu"), "magenta"),
-            ("VRAM", stats.get("vram"), _resource_level_style(stats.get("vram"))),
-        ]
-        for label, value, style in rows:
-            right.add_row(f"[bold]{label:<4}[/bold]", _resource_cell(value, style))
-        vram_label = stats.get("vram_label") or ""
-        if vram_label:
-            right.add_row("", f"[dim]{vram_label}[/dim]")
-
-        columns = Table.grid()
-        columns.add_column(justify="left")
-        columns.add_column(width=3)
-        columns.add_column(justify="left")
-        columns.add_row(left, "", right)
-        body = columns
-
-    blocks = [head, "", body]
-    # 辨識中即時逐字預覽:只在辨識中且已有內容時顯示;最多兩句,各自一行(滿了清掉最舊)。
+    # 4) 即時轉錄(主要前景):語者為強調,內容為前景白;最多兩句
     stream_text = fields.get("stream")
-    if kind != "download" and fields.get("stage") == "辨識中" and stream_text:
-        blocks += ["", Text("辨識中", style="bold cyan")]
+    if kind != "download" and stage == "辨識中" and stream_text:
+        spk = fields.get("stream_speaker")
+        blocks.append("")
+        if spk:
+            blocks.append(Text(f"語者{spk}", style="bold bright_cyan"))
         for ln in stream_text.split("\n"):
-            blocks.append(Text("  " + ln, style="white"))
+            blocks.append(Text(ln, style="white"))
+
+    # 5) 資源(次要,單行 dim)
+    if stats is not None:
+        blocks.append("")
+        blocks.append(_resource_line(stats))
+
     return Group(*blocks)
 
 
@@ -456,7 +445,7 @@ def fullscreen_progress(title="處理中", subtitle=None):
         panel_w = min(max(console.width - 4, 40), 62)
         tasks = progress.tasks
         if tasks:
-            content = render_dashboard(tasks[0], spinner)
+            content = render_dashboard(tasks[0], spinner, panel_w - 6)
         else:
             placeholder = Table.grid(padding=(0, 1))
             placeholder.add_column(no_wrap=True)
@@ -945,6 +934,10 @@ class _StreamingDecoder:
         self.key_candidate = None
         self.cur = []            # 目前字串的字元
         self.tail = ""           # 已完成 Content 的有界尾段(只留最近 keep_chars 字)
+        # 語者:依出現順序對應成 1、2…(與輸出檔的對話稿一致)
+        self.pending_speaker = None
+        self.current_speaker = None
+        self.speaker_map = {}
         self._dirty = False
         self._last_emit = 0.0
 
@@ -963,6 +956,8 @@ class _StreamingDecoder:
                         self.tail = (self.tail + s)[-self.keep_chars :]
                         self.capturing = False
                         self._dirty = True
+                    elif self.last_key == "Speaker":
+                        self.pending_speaker = s
                     self.last_key = None
                     self.value_mode = False
                 else:
@@ -977,9 +972,17 @@ class _StreamingDecoder:
             self.cur = []
             self.value_mode = self.last_key is not None
             self.capturing = self.value_mode and self.last_key == "Content"
+            if self.capturing and self.pending_speaker is not None:
+                if self.pending_speaker not in self.speaker_map:
+                    self.speaker_map[self.pending_speaker] = len(self.speaker_map) + 1
+                self.current_speaker = self.speaker_map[self.pending_speaker]
         elif ch == ":":
             self.last_key = self.key_candidate
-        elif ch in ",{}[]":
+        elif ch == "{":
+            self.last_key = None
+            self.key_candidate = None
+            self.pending_speaker = None
+        elif ch in ",}[]":
             self.last_key = None
             self.key_candidate = None
 
@@ -1006,7 +1009,7 @@ class _StreamingDecoder:
         self._last_emit = now
         self._dirty = False
         try:
-            self.on_text(self._current_text())
+            self.on_text(self._current_text(), self.current_speaker)
         except Exception:
             pass
 
@@ -1166,13 +1169,14 @@ def transcribe_windowed(
                             max_new_tokens=max_new_tokens,
                             chunk_size=chunk_size,
                             report=False,
-                            stream_callback=(lambda t: progress.update(task_id, stream=t)) if stream else None,
+                            stream_callback=(lambda t, spk: progress.update(task_id, stream=t, stream_speaker=spk)) if stream else None,
                         )
                     progress.update(
                         task_id,
                         advance=1,
                         stage="完成",
                         stream="",
+                        stream_speaker=None,
                         rtf=result.get("rtf", float("nan")),
                         resource=collect_resource_stats(),
                     )
@@ -1232,11 +1236,12 @@ def transcribe_windowed(
                 seg=f"{index}/{total_windows}",
                 span=f"{_fmt_clock(start_sec)} – {_fmt_clock(end_sec)}",
                 stream="",
+                stream_speaker=None,
             )
         else:
             ui_print(f"\n[bold]分段 {index}/{total_windows}[/bold] {start_sec:.1f}s - {end_sec:.1f}s")
         try:
-            sink = (lambda t: progress.update(task_id, stream=t)) if (stream and progress is not None) else None
+            sink = (lambda t, spk: progress.update(task_id, stream=t, stream_speaker=spk)) if (stream and progress is not None) else None
             result = transcribe(
                 processor,
                 model,
@@ -1273,6 +1278,7 @@ def transcribe_windowed(
                 stage="完成",
                 seg=f"{index}/{total_windows}",
                 stream="",
+                stream_speaker=None,
                 rtf=result.get("rtf", float("nan")),
             )
         results.append(result)
@@ -1355,20 +1361,65 @@ def convert_result_to_traditional(result):
 # --------------------------------------------------------------------------- #
 # 結果輸出
 # --------------------------------------------------------------------------- #
-def write_transcript(result, output_path, source_label, with_timestamps=False):
+def _speaker_numbering(parsed):
+    """依出現順序把原始語者標記對應成 1、2…(供對話稿與時間戳記區塊共用)。"""
+    mapping = {}
+    for seg in parsed or []:
+        if isinstance(seg, dict) and seg.get("Speaker") is not None:
+            key = str(seg.get("Speaker"))
+            if key not in mapping:
+                mapping[key] = len(mapping) + 1
+    return mapping
+
+
+def _speaker_labeled_text(parsed):
+    """把分段整理成對話稿:合併同語者連續段,語者依出現順序標成 1、2…。
+
+    僅在偵測到兩位以上語者時回傳對話稿,否則回傳 None(交由呼叫端用純文字)。
+    """
+    numbering = _speaker_numbering(parsed)
+    if len(numbering) < 2:
+        return None
+    turns = []  # [(語者編號, 內容)],合併同語者連續段
+    for seg in parsed:
+        if not isinstance(seg, dict):
+            continue
+        content = seg.get("Content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        num = numbering.get(str(seg.get("Speaker")), "?")
+        content = content.strip()
+        if turns and turns[-1][0] == num:
+            turns[-1][1] += content
+        else:
+            turns.append([num, content])
+    return "\n".join(f"語者{num}：{text}" for num, text in turns)
+
+
+def _render_body(result, speaker_labels):
+    """依設定回傳正文:多語者且開啟語者標示時用對話稿,否則用合併純文字。"""
+    if speaker_labels:
+        labeled = _speaker_labeled_text(result.get("parsed"))
+        if labeled:
+            return labeled
+    return result["text"].strip()
+
+
+def write_transcript(result, output_path, source_label, with_timestamps=False, speaker_labels=False):
     """把辨識結果寫入 .txt 檔。"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    lines = [result["text"].strip()]
+    lines = [_render_body(result, speaker_labels)]
 
     if with_timestamps and result["parsed"]:
         lines.append("")
         lines.append("=" * 60)
         lines.append("語者 / 時間戳記")
         lines.append("=" * 60)
+        numbering = _speaker_numbering(result["parsed"])
         for seg in result["parsed"]:
             start = seg.get("Start", "?")
             end = seg.get("End", "?")
-            speaker = seg.get("Speaker", "?")
+            speaker = numbering.get(str(seg.get("Speaker")), seg.get("Speaker", "?"))
             content = seg.get("Content", "")
             lines.append(f"[{start:>7} - {end:>7}] 語者{speaker}:{content}")
 
@@ -1404,7 +1455,8 @@ class Settings:
     preview_chars: int = 1200
     keep_recording: bool = True
     device: int = None
-    stream_preview: bool = True  # 辨識過程中即時顯示逐字內容
+    stream_preview: bool = True   # 辨識過程中即時顯示逐字內容
+    speaker_labels: bool = True   # 兩人以上時,正文/預覽以「語者N:」對話稿呈現
 
 
 def _interactive():
@@ -1725,10 +1777,17 @@ def render_result_summary(settings, result, output_path, source_label):
     table = Table.grid(padding=(0, 2))
     table.add_column(justify="right", style="cyan", no_wrap=True)
     table.add_column(style="white")
+    speakers = {
+        str(s.get("Speaker"))
+        for s in (result.get("parsed") or [])
+        if isinstance(s, dict) and s.get("Speaker") is not None
+    }
     table.add_row("來源", source_label)
     table.add_row("字數", str(len(text)))
     if segs:
         table.add_row("段落", str(segs))
+    if len(speakers) >= 2:
+        table.add_row("語者", f"{len(speakers)} 人")
     table.add_row("時間戳記", "開" if settings.with_timestamps else "關")
     table.add_row("輸出", _display_path(output_path))
     return Panel(table, title="[bold]辨識完成[/bold]", border_style="green", box=box.ROUNDED, padding=(1, 2))
@@ -1776,7 +1835,13 @@ def _redo_adjust(settings):
 
 def show_result(settings, result, output_path, source_label):
     """顯示結果摘要與預覽;回傳下一步決策:home / again / redo。"""
-    write_transcript(result, output_path, source_label, with_timestamps=settings.with_timestamps)
+    write_transcript(
+        result,
+        output_path,
+        source_label,
+        with_timestamps=settings.with_timestamps,
+        speaker_labels=settings.speaker_labels,
+    )
 
     if USE_RICH:
         console.print(render_result_summary(settings, result, output_path, source_label))
@@ -1784,7 +1849,7 @@ def show_result(settings, result, output_path, source_label):
         ui_rule("辨識結果")
 
     if settings.preview_chars != 0:
-        preview = result["text"].strip()
+        preview = _render_body(result, settings.speaker_labels)
         if settings.preview_chars > 0 and len(preview) > settings.preview_chars:
             preview = preview[: settings.preview_chars].rstrip() + "\n\n[dim]...(畫面預覽已截斷,完整內容見輸出檔)[/dim]"
         ui_panel("結果預覽", preview or "(空)", border_style="cyan")
@@ -1907,6 +1972,7 @@ def settings_menu(settings):
             ("chunk-size", str(settings.chunk_size)),
             ("產生上限 max-new-tokens", str(settings.max_new_tokens)),
             ("畫面預覽字數", "不顯示" if settings.preview_chars == 0 else str(settings.preview_chars)),
+            ("語者標示", "開(兩人以上)" if settings.speaker_labels else "關"),
             ("辨識即時預覽", "開" if settings.stream_preview else "關"),
             ("保留麥克風錄音檔", "是" if settings.keep_recording else "否"),
             ("返回", ""),
@@ -1926,8 +1992,10 @@ def settings_menu(settings):
         elif idx == 4:
             settings.preview_chars = _ask_int("畫面預覽字數(0 表示不顯示)", settings.preview_chars)
         elif idx == 5:
-            settings.stream_preview = not settings.stream_preview
+            settings.speaker_labels = not settings.speaker_labels
         elif idx == 6:
+            settings.stream_preview = not settings.stream_preview
+        elif idx == 7:
             settings.keep_recording = not settings.keep_recording
 
 
