@@ -363,30 +363,39 @@ def render_dashboard(task, spinner):
         left.add_row("RTF", rtf_text)
 
     if stats is None:
-        return Group(head, "", left)
+        body = left
+    else:
+        # 右欄:CPU/RAM/GPU/VRAM 計量(CPU/GPU 固定色,RAM/VRAM 依壓力變色)
+        right = Table.grid(padding=(0, 1))
+        right.add_column(justify="left", no_wrap=True)
+        right.add_column(justify="left", no_wrap=True)
+        rows = [
+            ("CPU", stats.get("cpu"), "cyan"),
+            ("RAM", stats.get("ram"), _resource_level_style(stats.get("ram"))),
+            ("GPU", stats.get("gpu"), "magenta"),
+            ("VRAM", stats.get("vram"), _resource_level_style(stats.get("vram"))),
+        ]
+        for label, value, style in rows:
+            right.add_row(f"[bold]{label:<4}[/bold]", _resource_cell(value, style))
+        vram_label = stats.get("vram_label") or ""
+        if vram_label:
+            right.add_row("", f"[dim]{vram_label}[/dim]")
 
-    # 右欄:CPU/RAM/GPU/VRAM 計量(CPU/GPU 固定色,RAM/VRAM 依壓力變色)
-    right = Table.grid(padding=(0, 1))
-    right.add_column(justify="left", no_wrap=True)
-    right.add_column(justify="left", no_wrap=True)
-    rows = [
-        ("CPU", stats.get("cpu"), "cyan"),
-        ("RAM", stats.get("ram"), _resource_level_style(stats.get("ram"))),
-        ("GPU", stats.get("gpu"), "magenta"),
-        ("VRAM", stats.get("vram"), _resource_level_style(stats.get("vram"))),
-    ]
-    for label, value, style in rows:
-        right.add_row(f"[bold]{label:<4}[/bold]", _resource_cell(value, style))
-    vram_label = stats.get("vram_label") or ""
-    if vram_label:
-        right.add_row("", f"[dim]{vram_label}[/dim]")
+        columns = Table.grid()
+        columns.add_column(justify="left")
+        columns.add_column(width=3)
+        columns.add_column(justify="left")
+        columns.add_row(left, "", right)
+        body = columns
 
-    columns = Table.grid()
-    columns.add_column(justify="left")
-    columns.add_column(width=3)
-    columns.add_column(justify="left")
-    columns.add_row(left, "", right)
-    return Group(head, "", columns)
+    blocks = [head, "", body]
+    # 辨識中即時逐字預覽:只在辨識中且已有內容時顯示;最多兩句,各自一行(滿了清掉最舊)。
+    stream_text = fields.get("stream")
+    if kind != "download" and fields.get("stage") == "辨識中" and stream_text:
+        blocks += ["", Text("辨識中", style="bold cyan")]
+        for ln in stream_text.split("\n"):
+            blocks.append(Text("  " + ln, style="white"))
+    return Group(*blocks)
 
 
 class ResourceMonitor:
@@ -787,6 +796,8 @@ def _chunk_retry_sizes(chunk_size):
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
 _CONTENT_RE = re.compile(r'"Content"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# 即時預覽用:依句末標點切句(逗號/頓號不算句末),最後一段允許是未收尾的半句。
+_SENT_RE = re.compile(r"[^。．.!?！？\n]*[。．.!?！？\n]|[^。．.!?！？\n]+")
 
 
 def _estimate_max_new_tokens(audio_sec, ceiling):
@@ -908,7 +919,133 @@ def _make_json_array_stopper(tokenizer, prompt_len):
     return _JsonArrayStopper()
 
 
-def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_NEW_TOKENS, chunk_size=None, report=True):
+class _StreamingDecoder:
+    """逐步把新 token 解碼成乾淨文字(UTF-8 安全),並抽出目前正在生成的 Content。
+
+    模型輸出是帶語者/時間戳的 JSON 陣列;此處以字元狀態機只取出 Content 值,
+    串成「目前已辨識內容」,並回傳尾端約一句話寬度餵給顯示回呼(節流避免過度刷新)。
+    """
+
+    def __init__(self, tokenizer, on_text, max_sentences=2, line_chars=40,
+                 keep_chars=400, min_interval=0.1):
+        self.tok = tokenizer
+        self.on_text = on_text
+        self.max_sentences = max_sentences   # 畫面最多保留幾句(滿了清掉最舊的)
+        self.line_chars = line_chars         # 單句過長時保留的尾端字數
+        self.keep_chars = keep_chars         # 僅保留最近這麼多字,足夠切出末兩句即可
+        self.min_interval = min_interval
+        self.tok_scanned = 0
+        self.cache = []          # 尚未 flush 的 token(可能含半個多位元組字)
+        # JSON 內容抽取狀態
+        self.in_str = False
+        self.esc = False
+        self.value_mode = False
+        self.capturing = False
+        self.last_key = None
+        self.key_candidate = None
+        self.cur = []            # 目前字串的字元
+        self.tail = ""           # 已完成 Content 的有界尾段(只留最近 keep_chars 字)
+        self._dirty = False
+        self._last_emit = 0.0
+
+    def _feed_char(self, ch):
+        if self.in_str:
+            if self.esc:
+                self.esc = False
+                self.cur.append(ch)
+            elif ch == "\\":
+                self.esc = True
+            elif ch == '"':
+                self.in_str = False
+                s = "".join(self.cur)
+                if self.value_mode:
+                    if self.capturing:
+                        self.tail = (self.tail + s)[-self.keep_chars :]
+                        self.capturing = False
+                        self._dirty = True
+                    self.last_key = None
+                    self.value_mode = False
+                else:
+                    self.key_candidate = s
+            else:
+                self.cur.append(ch)
+                if self.capturing:
+                    self._dirty = True
+            return
+        if ch == '"':
+            self.in_str = True
+            self.cur = []
+            self.value_mode = self.last_key is not None
+            self.capturing = self.value_mode and self.last_key == "Content"
+        elif ch == ":":
+            self.last_key = self.key_candidate
+        elif ch in ",{}[]":
+            self.last_key = None
+            self.key_candidate = None
+
+    def _current_text(self):
+        # 只取有界尾段 + 目前正在生成的半句,切句後保留最近 max_sentences 句。
+        partial = "".join(self.cur[-self.keep_chars :]) if self.capturing else ""
+        text = (self.tail + partial)[-self.keep_chars :].strip()
+        if not text:
+            return ""
+        sentences = [s.strip() for s in _SENT_RE.findall(text) if s.strip()]
+        lines = []
+        for s in sentences[-self.max_sentences :]:
+            if len(s) > self.line_chars:
+                s = "…" + s[-self.line_chars :]
+            lines.append(s)
+        return "\n".join(lines)
+
+    def _maybe_emit(self):
+        if not self._dirty:
+            return
+        now = time.time()
+        if now - self._last_emit < self.min_interval:
+            return
+        self._last_emit = now
+        self._dirty = False
+        try:
+            self.on_text(self._current_text())
+        except Exception:
+            pass
+
+    def push(self, gen_ids):
+        total = gen_ids.shape[0] if hasattr(gen_ids, "shape") else len(gen_ids)
+        if total <= self.tok_scanned:
+            return
+        new = gen_ids[self.tok_scanned :]
+        self.tok_scanned = total
+        new_list = new.tolist() if hasattr(new, "tolist") else list(new)
+        self.cache.extend(new_list)
+        decoded = self.tok.decode(self.cache, skip_special_tokens=False)
+        if decoded.endswith("�"):
+            return  # 半個多位元組字,等下一步補齊再 flush
+        self.cache = []
+        for ch in decoded:
+            self._feed_char(ch)
+        self._maybe_emit()
+
+
+def _make_stream_criteria(tokenizer, prompt_len, on_text):
+    """只負責即時顯示、永不停止的 StoppingCriteria(與原停止條件並存,不影響其行為)。"""
+    from transformers import StoppingCriteria
+    import torch
+
+    decoder = _StreamingDecoder(tokenizer, on_text)
+
+    class _StreamCriteria(StoppingCriteria):
+        def __call__(self, input_ids, scores=None, **kwargs):
+            try:
+                decoder.push(input_ids[0, prompt_len:])
+            except Exception:
+                pass
+            return torch.tensor([False], device=input_ids.device)
+
+    return _StreamCriteria()
+
+
+def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_NEW_TOKENS, chunk_size=None, report=True, stream_callback=None):
     """對單段音訊執行辨識,回傳 raw / parsed / text 三種結果。"""
     import torch
 
@@ -940,9 +1077,11 @@ def transcribe(processor, model, audio, prompt=None, max_new_tokens=DEFAULT_MAX_
         if current_chunk_size:
             gen_kwargs["acoustic_tokenizer_chunk_size"] = current_chunk_size
         # 轉錄陣列收尾即停,避免高上限下空吐浪費時間;停止條件有狀態,每次嘗試都重建。
-        gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
-            [_make_json_array_stopper(processor.tokenizer, prompt_len)]
-        )
+        _criteria = [_make_json_array_stopper(processor.tokenizer, prompt_len)]
+        # 另掛一個「只顯示、永不停止」的條件做即時逐字預覽,不影響上面的停止行為。
+        if stream_callback is not None:
+            _criteria.append(_make_stream_criteria(processor.tokenizer, prompt_len, stream_callback))
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList(_criteria)
 
         try:
             with torch.inference_mode():
@@ -999,6 +1138,7 @@ def transcribe_windowed(
     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     chunk_size=None,
     window_seconds=DEFAULT_WINDOW_SECONDS,
+    stream=False,
 ):
     """Split long audio into bounded windows to avoid long-context GPU OOM."""
     window_samples = int(window_seconds * TARGET_SR)
@@ -1026,11 +1166,13 @@ def transcribe_windowed(
                             max_new_tokens=max_new_tokens,
                             chunk_size=chunk_size,
                             report=False,
+                            stream_callback=(lambda t: progress.update(task_id, stream=t)) if stream else None,
                         )
                     progress.update(
                         task_id,
                         advance=1,
                         stage="完成",
+                        stream="",
                         rtf=result.get("rtf", float("nan")),
                         resource=collect_resource_stats(),
                     )
@@ -1065,6 +1207,7 @@ def transcribe_windowed(
                 max_new_tokens=max_new_tokens,
                 chunk_size=chunk_size,
                 window_seconds=smaller_window,
+                stream=stream,
             )
 
     total_windows = (len(audio) + window_samples - 1) // window_samples
@@ -1088,10 +1231,12 @@ def transcribe_windowed(
                 stage="辨識中",
                 seg=f"{index}/{total_windows}",
                 span=f"{_fmt_clock(start_sec)} – {_fmt_clock(end_sec)}",
+                stream="",
             )
         else:
             ui_print(f"\n[bold]分段 {index}/{total_windows}[/bold] {start_sec:.1f}s - {end_sec:.1f}s")
         try:
+            sink = (lambda t: progress.update(task_id, stream=t)) if (stream and progress is not None) else None
             result = transcribe(
                 processor,
                 model,
@@ -1100,6 +1245,7 @@ def transcribe_windowed(
                 max_new_tokens=max_new_tokens,
                 chunk_size=chunk_size,
                 report=progress is None,
+                stream_callback=sink,
             )
         except Exception as exc:
             import torch
@@ -1118,6 +1264,7 @@ def transcribe_windowed(
                 max_new_tokens=max_new_tokens,
                 chunk_size=chunk_size,
                 window_seconds=smaller_window,
+                stream=stream,
             )
         if progress is not None:
             progress.update(
@@ -1125,6 +1272,7 @@ def transcribe_windowed(
                 advance=1,
                 stage="完成",
                 seg=f"{index}/{total_windows}",
+                stream="",
                 rtf=result.get("rtf", float("nan")),
             )
         results.append(result)
@@ -1256,6 +1404,7 @@ class Settings:
     preview_chars: int = 1200
     keep_recording: bool = True
     device: int = None
+    stream_preview: bool = True  # 辨識過程中即時顯示逐字內容
 
 
 def _interactive():
@@ -1527,6 +1676,7 @@ def run_transcription(settings, state, audio, source_label):
                 max_new_tokens=settings.max_new_tokens,
                 chunk_size=settings.chunk_size,
                 window_seconds=settings.window_seconds,
+                stream=settings.stream_preview,
             )
         except Exception as exc:
             import torch
@@ -1547,6 +1697,7 @@ def run_transcription(settings, state, audio, source_label):
                         max_new_tokens=settings.max_new_tokens,
                         chunk_size=settings.chunk_size,
                         window_seconds=DEFAULT_WINDOW_SECONDS,
+                        stream=settings.stream_preview,
                     )
                 except Exception as exc2:
                     ui_error(f"辨識失敗:{exc2}")
@@ -1756,6 +1907,7 @@ def settings_menu(settings):
             ("chunk-size", str(settings.chunk_size)),
             ("產生上限 max-new-tokens", str(settings.max_new_tokens)),
             ("畫面預覽字數", "不顯示" if settings.preview_chars == 0 else str(settings.preview_chars)),
+            ("辨識即時預覽", "開" if settings.stream_preview else "關"),
             ("保留麥克風錄音檔", "是" if settings.keep_recording else "否"),
             ("返回", ""),
         ]
@@ -1774,6 +1926,8 @@ def settings_menu(settings):
         elif idx == 4:
             settings.preview_chars = _ask_int("畫面預覽字數(0 表示不顯示)", settings.preview_chars)
         elif idx == 5:
+            settings.stream_preview = not settings.stream_preview
+        elif idx == 6:
             settings.keep_recording = not settings.keep_recording
 
 
