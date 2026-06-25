@@ -16,6 +16,9 @@ voice/
 recordings/
 output/
 
+# 內部 AI 工作指引(僅本機保留,不發佈到 repo)
+CLAUDE.md
+
 # 作業系統 / 編輯器
 .DS_Store
 Thumbs.db
