@@ -78,34 +78,30 @@ DEFAULT_MODEL = MODEL_DIR if os.path.isdir(MODEL_DIR) else MODEL_ID
 
 try:
     from rich import box
+    from rich.align import Align
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        SpinnerColumn,
-        TaskProgressColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    from rich.progress_bar import ProgressBar
+    from rich.progress import Progress
     from rich.prompt import Confirm, Prompt
+    from rich.spinner import Spinner
     from rich.table import Table
+    from rich.text import Text
 
     RICH_AVAILABLE = True
 except Exception:
     box = None
+    Align = None
     Console = None
     Group = None
     Live = None
     Panel = None
     Progress = None
-    ProgressBar = None
+    Spinner = None
     Confirm = None
     Prompt = None
     Table = None
+    Text = None
     RICH_AVAILABLE = False
 
 
@@ -226,17 +222,9 @@ def print_app_header():
 
 
 def make_progress():
-    # 進度列只放會自動縮放的欄位(spinner / 描述 / bar / 百分比 / 時間),
-    # status 與 resource 兩個較長的欄位改由 fullscreen_progress 拆成獨立行呈現。
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    )
+    # 僅作為進度 / 已用 / 預估剩餘的狀態追蹤;實際畫面由 fullscreen_progress
+    # 以自訂雙欄儀表板繪製,不使用 Progress 內建欄位渲染。
+    return Progress(console=console)
 
 
 def collect_resource_stats():
@@ -284,33 +272,121 @@ def _resource_level_style(value):
     return "green"
 
 
-def render_resource_bars(stats):
-    """把資源使用率畫成多行進度條(每項一行:標籤 + bar + 百分比)。"""
-    grid = Table.grid(padding=(0, 1))
-    grid.add_column(justify="left", no_wrap=True)   # 標籤
-    grid.add_column(no_wrap=True)                   # 進度條
-    grid.add_column(justify="right", no_wrap=True)  # 百分比
-    grid.add_column(justify="left", no_wrap=True)   # 附註(VRAM 容量)
+def _fmt_clock(seconds):
+    """秒數轉 MM:SS(超過一小時轉 H:MM:SS);無值或非數時回傳佔位。"""
+    if seconds is None:
+        return "--:--"
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "--:--"
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):
+        return "--:--"
+    seconds = int(max(0, seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
-    # CPU/GPU 為使用率(固定色),RAM/VRAM 為記憶體壓力(依高低變色,接近滿載示警)。
+
+def _meter(value, width, style, filled="▰", empty="▱"):
+    """資源小計量條(不含邊框與百分比),value 為 0–100 或 None。"""
+    if value is None:
+        return f"[grey35]{empty * width}[/grey35]"
+    completed = max(0.0, min(100.0, float(value)))
+    n = max(0, min(width, int(round(completed / 100 * width))))
+    return f"[{style}]{filled * n}[/{style}][grey35]{empty * (width - n)}[/grey35]"
+
+
+def _progress_bar_text(percentage, width):
+    """主進度條(實心粗筆畫,與較細的資源計量條區隔)。"""
+    completed = max(0.0, min(100.0, float(percentage or 0)))
+    n = max(0, min(width, int(round(completed / 100 * width))))
+    return (
+        f"[grey42]▕[/grey42][bright_cyan]{'█' * n}[/bright_cyan]"
+        f"[grey30]{'░' * (width - n)}[/grey30][grey42]▏[/grey42]"
+    )
+
+
+def _resource_cell(value, style, width=8):
+    """單一資源列的「邊框計量條 + 百分比」。"""
+    bar = _meter(value, width, style)
+    pct = f"[{style}]{value:>3.0f}%[/{style}]" if value is not None else "[grey50] --%[/grey50]"
+    return f"[grey42]▕[/grey42]{bar}[grey42]▏[/grey42] {pct}"
+
+
+def render_dashboard(task, spinner):
+    """把一個進度任務畫成雙欄儀表板:上方主進度,左欄時間/狀態,右欄資源計量。
+
+    同時支援辨識任務(kind=asr:範圍/RTF)與下載任務(kind=download:檔案)。
+    """
+    fields = task.fields
+    kind = fields.get("kind", "asr")
+    stats = fields.get("resource") if isinstance(fields.get("resource"), dict) else None
+    pct = task.percentage or 0.0
+    elapsed = _fmt_clock(task.elapsed)
+    remaining = task.time_remaining
+    remaining_text = f"約 {_fmt_clock(remaining)}" if remaining else "—"
+
+    # 第一列:spinner + 主進度條 + 百分比 +(辨識才有的)段數/階段
+    head = Table.grid(padding=(0, 1))
+    head.add_column(no_wrap=True)
+    head.add_column(no_wrap=True)
+    head.add_column(justify="right", no_wrap=True)
+    head.add_column(no_wrap=True)
+    if kind == "download":
+        right_label = ""
+    else:
+        parts = []
+        if fields.get("seg"):
+            parts.append(f"[bold]段 {fields['seg']}[/bold]")
+        if fields.get("stage"):
+            parts.append(f"[dim]{fields['stage']}[/dim]")
+        right_label = "  ".join(parts)
+    head.add_row(spinner, _progress_bar_text(pct, 30), f"[bold]{pct:>3.0f}%[/bold]", right_label)
+
+    # 左欄:時間 / 狀態
+    left = Table.grid(padding=(0, 1))
+    left.add_column(justify="left", no_wrap=True, style="dim")
+    left.add_column(justify="left", no_wrap=True, max_width=26, overflow="ellipsis")
+    if kind == "download":
+        left.add_row("檔案", Text(fields.get("status") or "—"))
+        left.add_row("已用", elapsed)
+        left.add_row("剩餘", remaining_text)
+    else:
+        rtf = fields.get("rtf")
+        rtf_text = f"{rtf:.2f}" if isinstance(rtf, (int, float)) and rtf == rtf else "—"
+        left.add_row("範圍", fields.get("span") or "—")
+        left.add_row("已用", elapsed)
+        left.add_row("剩餘", remaining_text)
+        left.add_row("RTF", rtf_text)
+
+    if stats is None:
+        return Group(head, "", left)
+
+    # 右欄:CPU/RAM/GPU/VRAM 計量(CPU/GPU 固定色,RAM/VRAM 依壓力變色)
+    right = Table.grid(padding=(0, 1))
+    right.add_column(justify="left", no_wrap=True)
+    right.add_column(justify="left", no_wrap=True)
     rows = [
-        ("CPU", stats.get("cpu"), "cyan", ""),
-        ("RAM", stats.get("ram"), _resource_level_style(stats.get("ram")), ""),
-        ("GPU", stats.get("gpu"), "magenta", ""),
-        ("VRAM", stats.get("vram"), _resource_level_style(stats.get("vram")), stats.get("vram_label") or ""),
+        ("CPU", stats.get("cpu"), "cyan"),
+        ("RAM", stats.get("ram"), _resource_level_style(stats.get("ram"))),
+        ("GPU", stats.get("gpu"), "magenta"),
+        ("VRAM", stats.get("vram"), _resource_level_style(stats.get("vram"))),
     ]
-    for label, value, style, extra in rows:
-        completed = float(value) if value is not None else 0
-        bar = ProgressBar(
-            total=100,
-            completed=completed,
-            width=26,
-            complete_style=style,
-            finished_style=style,
-        )
-        pct = f"[{style}]{value:>3.0f}%[/{style}]" if value is not None else "[grey50] --%[/grey50]"
-        grid.add_row(f"[bold]{label:<4}[/bold]", bar, pct, f"[dim]{extra}[/dim]" if extra else "")
-    return grid
+    for label, value, style in rows:
+        right.add_row(f"[bold]{label:<4}[/bold]", _resource_cell(value, style))
+    vram_label = stats.get("vram_label") or ""
+    if vram_label:
+        right.add_row("", f"[dim]{vram_label}[/dim]")
+
+    columns = Table.grid()
+    columns.add_column(justify="left")
+    columns.add_column(width=3)
+    columns.add_column(justify="left")
+    columns.add_row(left, "", right)
+    return Group(head, "", columns)
 
 
 class ResourceMonitor:
@@ -365,35 +441,43 @@ def fullscreen_progress(title="處理中", subtitle=None):
     """
     progress = make_progress()
     log = []
+    spinner = Spinner("dots", style="cyan")  # 持久實例,跨刷新才會持續轉動
 
     def render():
-        # 進度列為第一行;status 一行;CPU/RAM/GPU/VRAM 各自一行並以進度條呈現。
-        inner = [progress]
-        for task in progress.tasks:
-            status = task.fields.get("status")
-            resource = task.fields.get("resource")
-            if status:
-                inner.append(f"[dim]{status}[/dim]")
-            if isinstance(resource, dict):
-                inner.append(render_resource_bars(resource))
+        panel_w = min(max(console.width - 4, 40), 62)
+        tasks = progress.tasks
+        if tasks:
+            content = render_dashboard(tasks[0], spinner)
+        else:
+            placeholder = Table.grid(padding=(0, 1))
+            placeholder.add_column(no_wrap=True)
+            placeholder.add_column(no_wrap=True)
+            placeholder.add_row(spinner, "[dim]準備中...[/dim]")
+            content = placeholder
         body = [
-            Panel(
-                Group(*inner),
-                title=f"[bold]{title}[/bold]",
-                subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
-                border_style="cyan",
-                box=box.ROUNDED,
-                padding=(1, 2),
+            Align.center(
+                Panel(
+                    content,
+                    title=f"[bold]{title}[/bold]",
+                    subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                    width=panel_w,
+                )
             )
         ]
         if log:
             body.append(
-                Panel(
-                    Group(*log[-8:]),
-                    title="[bold]訊息[/bold]",
-                    border_style="yellow",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
+                Align.center(
+                    Panel(
+                        Group(*log[-8:]),
+                        title="[bold]訊息[/bold]",
+                        border_style="grey42",
+                        box=box.ROUNDED,
+                        padding=(0, 1),
+                        width=panel_w,
+                    )
                 )
             )
         return Group(*body)
@@ -589,6 +673,7 @@ def download_model(model_id):
             task_id = progress.add_task(
                 "下載模型",
                 total=total,
+                kind="download",
                 status=f"0/{total_files} 檔案",
                 resource=collect_resource_stats(),
             )
@@ -921,10 +1006,15 @@ def transcribe_windowed(
         try:
             if USE_RICH:
                 with fullscreen_progress("語音辨識") as progress:
+                    dur = len(audio) / TARGET_SR
                     task_id = progress.add_task(
                         "語音辨識",
                         total=1,
-                        status=f"單段 {format_duration(len(audio) / TARGET_SR)}",
+                        kind="asr",
+                        seg=None,
+                        span=f"{_fmt_clock(0)} – {_fmt_clock(dur)}",
+                        rtf=None,
+                        stage="辨識中",
                         resource=collect_resource_stats(),
                     )
                     with ResourceMonitor(progress, task_id):
@@ -937,7 +1027,13 @@ def transcribe_windowed(
                             chunk_size=chunk_size,
                             report=False,
                         )
-                    progress.update(task_id, advance=1, status=f"完成 RTF={result.get('rtf', float('nan')):.2f}", resource=collect_resource_stats())
+                    progress.update(
+                        task_id,
+                        advance=1,
+                        stage="完成",
+                        rtf=result.get("rtf", float("nan")),
+                        resource=collect_resource_stats(),
+                    )
                     return result
             return transcribe(
                 processor,
@@ -986,9 +1082,13 @@ def transcribe_windowed(
         end = min(start + window_samples, len(audio))
         start_sec = start / TARGET_SR
         end_sec = end / TARGET_SR
-        status = f"{index}/{total_windows}  {format_duration(start_sec)} - {format_duration(end_sec)}"
         if progress is not None:
-            progress.update(task_id, status=status)
+            progress.update(
+                task_id,
+                stage="辨識中",
+                seg=f"{index}/{total_windows}",
+                span=f"{_fmt_clock(start_sec)} – {_fmt_clock(end_sec)}",
+            )
         else:
             ui_print(f"\n[bold]分段 {index}/{total_windows}[/bold] {start_sec:.1f}s - {end_sec:.1f}s")
         try:
@@ -1020,7 +1120,13 @@ def transcribe_windowed(
                 window_seconds=smaller_window,
             )
         if progress is not None:
-            progress.update(task_id, advance=1, status=f"完成 {index}/{total_windows}  RTF={result.get('rtf', float('nan')):.2f}")
+            progress.update(
+                task_id,
+                advance=1,
+                stage="完成",
+                seg=f"{index}/{total_windows}",
+                rtf=result.get("rtf", float("nan")),
+            )
         results.append(result)
         if result["raw"]:
             raw_parts.append(result["raw"].strip())
@@ -1032,7 +1138,16 @@ def transcribe_windowed(
 
     if USE_RICH:
         with fullscreen_progress("分段辨識", subtitle=f"每段 {window_seconds:g}s · 共 {total_windows} 段") as progress:
-            task_id = progress.add_task("分段辨識", total=total_windows, status="準備中", resource=collect_resource_stats())
+            task_id = progress.add_task(
+                "分段辨識",
+                total=total_windows,
+                kind="asr",
+                seg=None,
+                span=None,
+                rtf=None,
+                stage="準備中",
+                resource=collect_resource_stats(),
+            )
             with ResourceMonitor(progress, task_id):
                 for index, start in enumerate(range(0, len(audio), window_samples), start=1):
                     run_window(index, start, progress, task_id)
@@ -1390,83 +1505,164 @@ def print_run_config(settings, source_label, audio, output_path):
 
 
 def run_transcription(settings, state, audio, source_label):
-    processor, model = ensure_model(settings, state)
-    if model is None:
-        pause()
-        return
+    """辨識同一段音訊;回傳 'home'(返回主選單)或 'again'(再辨識一個)。
 
-    output_path = default_output_path(source_label)
-    print_run_config(settings, source_label, audio, output_path)
-
-    try:
-        result = transcribe_windowed(
-            processor,
-            model,
-            audio,
-            prompt=settings.prompt or None,
-            max_new_tokens=settings.max_new_tokens,
-            chunk_size=settings.chunk_size,
-            window_seconds=settings.window_seconds,
-        )
-    except Exception as exc:
-        import torch
-
-        audio_sec = len(audio) / TARGET_SR
-        if (
-            _is_cuda_oom(exc, torch)
-            and settings.window_seconds <= 0
-            and audio_sec > MIN_WINDOW_SECONDS
-        ):
-            ui_warning(f"單次處理發生 OOM,自動改用 {DEFAULT_WINDOW_SECONDS:g}s 分段重試。")
-            try:
-                result = transcribe_windowed(
-                    processor,
-                    model,
-                    audio,
-                    prompt=settings.prompt or None,
-                    max_new_tokens=settings.max_new_tokens,
-                    chunk_size=settings.chunk_size,
-                    window_seconds=DEFAULT_WINDOW_SECONDS,
-                )
-            except Exception as exc2:
-                ui_error(f"辨識失敗:{exc2}")
-                pause()
-                return
-        else:
-            ui_error(f"辨識失敗:{exc}")
+    使用者在結果頁選「換設定重辨」時,於此迴圈內沿用同一段音訊重跑。
+    """
+    while True:
+        processor, model = ensure_model(settings, state)
+        if model is None:
             pause()
-            return
+            return "home"
 
-    # 辨識結果自動簡轉繁(台灣慣用詞),預覽與輸出檔都套用。
-    with ui_status("[cyan]簡轉繁轉換中...[/cyan]"):
-        convert_result_to_traditional(result)
+        output_path = default_output_path(source_label)
+        print_run_config(settings, source_label, audio, output_path)
 
-    show_result(settings, result, output_path, source_label)
+        try:
+            result = transcribe_windowed(
+                processor,
+                model,
+                audio,
+                prompt=settings.prompt or None,
+                max_new_tokens=settings.max_new_tokens,
+                chunk_size=settings.chunk_size,
+                window_seconds=settings.window_seconds,
+            )
+        except Exception as exc:
+            import torch
+
+            audio_sec = len(audio) / TARGET_SR
+            if (
+                _is_cuda_oom(exc, torch)
+                and settings.window_seconds <= 0
+                and audio_sec > MIN_WINDOW_SECONDS
+            ):
+                ui_warning(f"單次處理發生 OOM,自動改用 {DEFAULT_WINDOW_SECONDS:g}s 分段重試。")
+                try:
+                    result = transcribe_windowed(
+                        processor,
+                        model,
+                        audio,
+                        prompt=settings.prompt or None,
+                        max_new_tokens=settings.max_new_tokens,
+                        chunk_size=settings.chunk_size,
+                        window_seconds=DEFAULT_WINDOW_SECONDS,
+                    )
+                except Exception as exc2:
+                    ui_error(f"辨識失敗:{exc2}")
+                    pause()
+                    return "home"
+            else:
+                ui_error(f"辨識失敗:{exc}")
+                pause()
+                return "home"
+
+        # 辨識結果自動簡轉繁(台灣慣用詞),預覽與輸出檔都套用。
+        with ui_status("[cyan]簡轉繁轉換中...[/cyan]"):
+            convert_result_to_traditional(result)
+
+        decision = show_result(settings, result, output_path, source_label)
+        if decision == "redo":
+            continue  # 換設定重辨:沿用同一段音訊重跑(設定可能已在 _redo_adjust 調整)
+        return decision
+
+
+def render_result_summary(settings, result, output_path, source_label):
+    """辨識完成摘要面板(與『本次設定』同一套視覺)。"""
+    text = result["text"].strip()
+    segs = len(result["parsed"]) if result.get("parsed") else 0
+    table = Table.grid(padding=(0, 2))
+    table.add_column(justify="right", style="cyan", no_wrap=True)
+    table.add_column(style="white")
+    table.add_row("來源", source_label)
+    table.add_row("字數", str(len(text)))
+    if segs:
+        table.add_row("段落", str(segs))
+    table.add_row("時間戳記", "開" if settings.with_timestamps else "關")
+    table.add_row("輸出", _display_path(output_path))
+    return Panel(table, title="[bold]辨識完成[/bold]", border_style="green", box=box.ROUNDED, padding=(1, 2))
+
+
+def _result_oneline(result, source_label, output_path):
+    """『接下來』選單上方的精簡摘要列。"""
+    chars = len(result["text"].strip())
+    return Panel(
+        f"[green]● 辨識完成[/green]    [cyan]來源[/cyan] {source_label}    "
+        f"[cyan]字數[/cyan] {chars}    [cyan]輸出[/cyan] {_display_path(output_path)}",
+        border_style="green",
+        box=box.ROUNDED,
+        padding=(0, 2),
+    )
+
+
+def _redo_adjust(settings):
+    """『換設定重辨』前的快速調整;回傳 True 表示開始重辨,False 表示取消。"""
+    quant_order = ["4bit", "8bit", "none"]
+    while True:
+        items = [
+            ("開始重新辨識", "套用下列設定,沿用同一段音訊"),
+            (f"時間戳記:{'開' if settings.with_timestamps else '關'}", "Enter 切換"),
+            (f"量化模式:{settings.quant}", "Enter 循環 4bit → 8bit → none"),
+            ("分段秒數", "單次優先" if settings.window_seconds <= 0 else f"{settings.window_seconds:g}s"),
+            ("熱詞 / 提示", settings.prompt or "(無)"),
+            ("取消", ""),
+        ]
+        idx = select_menu("換設定重辨", items, subtitle="↑↓ 選擇 · Enter 確認 · Esc 取消")
+        if idx is None or idx == len(items) - 1:
+            return False
+        if idx == 0:
+            return True
+        if idx == 1:
+            settings.with_timestamps = not settings.with_timestamps
+        elif idx == 2:
+            settings.quant = quant_order[(quant_order.index(settings.quant) + 1) % len(quant_order)]
+        elif idx == 3:
+            settings.window_seconds = _ask_float("分段秒數(0 表示先嘗試單次)", settings.window_seconds)
+        elif idx == 4:
+            text = ask_text("熱詞/提示(留空表示無)", default=settings.prompt or "").strip()
+            settings.prompt = text or None
 
 
 def show_result(settings, result, output_path, source_label):
-    ui_rule("辨識結果")
-    preview = result["text"].strip()
-    if settings.preview_chars != 0:
-        if settings.preview_chars > 0 and len(preview) > settings.preview_chars:
-            preview = preview[: settings.preview_chars].rstrip() + "\n\n[dim]...(畫面預覽已截斷,完整內容見輸出檔)[/dim]"
-        ui_panel("結果預覽", preview or "(空)", border_style="green")
-
+    """顯示結果摘要與預覽;回傳下一步決策:home / again / redo。"""
     write_transcript(result, output_path, source_label, with_timestamps=settings.with_timestamps)
 
-    action = select_menu(
-        "接下來",
-        [
-            ("返回主選單", ""),
-            ("開啟輸出資料夾", _display_path(OUTPUT_DIR)),
-            ("複製辨識結果", ""),
-        ],
-        subtitle="↑↓ 選擇 · Enter 確認",
-    )
-    if action == 1:
-        _open_folder(OUTPUT_DIR)
-    elif action == 2:
-        _copy_text(result["text"].strip())
+    if USE_RICH:
+        console.print(render_result_summary(settings, result, output_path, source_label))
+    else:
+        ui_rule("辨識結果")
+
+    if settings.preview_chars != 0:
+        preview = result["text"].strip()
+        if settings.preview_chars > 0 and len(preview) > settings.preview_chars:
+            preview = preview[: settings.preview_chars].rstrip() + "\n\n[dim]...(畫面預覽已截斷,完整內容見輸出檔)[/dim]"
+        ui_panel("結果預覽", preview or "(空)", border_style="cyan")
+
+    header = _result_oneline(result, source_label, output_path) if USE_RICH else None
+    while True:
+        action = select_menu(
+            "接下來",
+            [
+                ("返回主選單", ""),
+                ("換設定重辨", "同一段音訊,改設定再跑一次"),
+                ("再辨識一個", "回到來源選擇"),
+                ("開啟輸出資料夾", _display_path(OUTPUT_DIR)),
+                ("複製辨識結果", "純文字到剪貼簿"),
+            ],
+            subtitle="↑↓ 選擇 · Enter 確認 · Esc 返回主選單",
+            header=header,
+        )
+        if action is None or action == 0:
+            return "home"
+        if action == 1:
+            if _redo_adjust(settings):
+                return "redo"
+        elif action == 2:
+            return "again"
+        elif action == 3:
+            _open_folder(OUTPUT_DIR)
+        elif action == 4:
+            _copy_text(result["text"].strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -1490,69 +1686,71 @@ def choose_audio_file():
 
 
 def flow_file(settings, state):
-    path = choose_audio_file()
-    if not path:
-        return
-    ui_print(f"[bold cyan]載入音訊檔[/bold cyan] {path}")
-    try:
-        with ui_status("[cyan]讀取與重採樣中...[/cyan]"):
-            audio = load_audio_file(path)
-    except Exception as exc:
-        ui_error(f"載入失敗:{exc}")
-        pause()
-        return
-    if audio.size == 0:
-        ui_error("音訊內容為空。")
-        pause()
-        return
-    source_label = os.path.splitext(os.path.basename(path))[0]
-    run_transcription(settings, state, audio, source_label)
+    while True:
+        path = choose_audio_file()
+        if not path:
+            return
+        ui_print(f"[bold cyan]載入音訊檔[/bold cyan] {path}")
+        try:
+            with ui_status("[cyan]讀取與重採樣中...[/cyan]"):
+                audio = load_audio_file(path)
+        except Exception as exc:
+            ui_error(f"載入失敗:{exc}")
+            pause()
+            continue
+        if audio.size == 0:
+            ui_error("音訊內容為空。")
+            pause()
+            continue
+        source_label = os.path.splitext(os.path.basename(path))[0]
+        if run_transcription(settings, state, audio, source_label) != "again":
+            return
 
 
 def flow_record(settings, state):
-    mode = select_menu(
-        "麥克風錄音",
-        [
-            ("按 Enter 起訖", "不限長度,適合長段談話"),
-            ("錄固定秒數", ""),
-            ("返回", ""),
-        ],
-    )
-    if mode is None or mode == 2:
-        return
+    while True:
+        mode = select_menu(
+            "麥克風錄音",
+            [
+                ("按 Enter 起訖", "不限長度,適合長段談話"),
+                ("錄固定秒數", ""),
+                ("返回", ""),
+            ],
+        )
+        if mode is None or mode == 2:
+            return
 
-    try:
-        if mode == 0:
-            audio = record_until_enter(device=settings.device)
-        else:
-            seconds = _ask_float("錄音秒數", 10)
-            audio = record_fixed(seconds, device=settings.device)
-    except Exception as exc:
-        ui_error(f"錄音失敗:{exc}")
-        pause()
-        return
+        try:
+            if mode == 0:
+                audio = record_until_enter(device=settings.device)
+            else:
+                seconds = _ask_float("錄音秒數", 10)
+                audio = record_fixed(seconds, device=settings.device)
+        except Exception as exc:
+            ui_error(f"錄音失敗:{exc}")
+            pause()
+            continue
 
-    if audio.size == 0:
-        ui_error("沒有錄到任何音訊。")
-        pause()
-        return
+        if audio.size == 0:
+            ui_error("沒有錄到任何音訊。")
+            pause()
+            continue
 
-    if settings.keep_recording:
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_wav(os.path.join(RECORDING_DIR, f"recording_{stamp}.wav"), audio)
+        if settings.keep_recording:
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_wav(os.path.join(RECORDING_DIR, f"recording_{stamp}.wav"), audio)
 
-    run_transcription(settings, state, audio, "recording")
+        if run_transcription(settings, state, audio, "recording") != "again":
+            return
 
 
 # --------------------------------------------------------------------------- #
 # 設定與裝置
 # --------------------------------------------------------------------------- #
 def settings_menu(settings):
-    quant_order = ["4bit", "8bit", "none"]
+    # 量化模式、時間戳記已上移為主畫面快速切換,此處只保留其餘參數。
     while True:
         items = [
-            ("量化模式", f"{settings.quant}  (循環切換)"),
-            ("附加語者/時間戳記", "開" if settings.with_timestamps else "關"),
             ("熱詞 / 提示", settings.prompt or "(無)"),
             ("分段秒數", "單次優先" if settings.window_seconds <= 0 else f"{settings.window_seconds:g}s"),
             ("chunk-size", str(settings.chunk_size)),
@@ -1561,25 +1759,21 @@ def settings_menu(settings):
             ("保留麥克風錄音檔", "是" if settings.keep_recording else "否"),
             ("返回", ""),
         ]
-        idx = select_menu("設定", items, subtitle="↑↓ 選擇 · Enter 修改 · Esc 返回")
+        idx = select_menu("其他設定", items, subtitle="↑↓ 選擇 · Enter 修改 · Esc 返回")
         if idx is None or idx == len(items) - 1:
             return
         if idx == 0:
-            settings.quant = quant_order[(quant_order.index(settings.quant) + 1) % len(quant_order)]
-        elif idx == 1:
-            settings.with_timestamps = not settings.with_timestamps
-        elif idx == 2:
             text = ask_text("熱詞/提示(留空表示無)", default=settings.prompt or "").strip()
             settings.prompt = text or None
-        elif idx == 3:
+        elif idx == 1:
             settings.window_seconds = _ask_float("分段秒數(0 表示先嘗試單次)", settings.window_seconds)
-        elif idx == 4:
+        elif idx == 2:
             settings.chunk_size = _normalize_chunk_size(_ask_int("chunk-size", settings.chunk_size)) or DEFAULT_CHUNK_SIZE
-        elif idx == 5:
+        elif idx == 3:
             settings.max_new_tokens = _ask_int("max-new-tokens", settings.max_new_tokens)
-        elif idx == 6:
+        elif idx == 4:
             settings.preview_chars = _ask_int("畫面預覽字數(0 表示不顯示)", settings.preview_chars)
-        elif idx == 7:
+        elif idx == 5:
             settings.keep_recording = not settings.keep_recording
 
 
@@ -1620,6 +1814,60 @@ def devices_menu(settings):
     pause()
 
 
+def _device_label(device):
+    """主畫面用的麥克風裝置標籤。"""
+    if device is None:
+        return "系統預設"
+    return f"輸入裝置 #{device}"
+
+
+def _model_state_text(settings, state):
+    """模型載入狀態(含量化是否與目前設定一致)。"""
+    if state.get("model") is None:
+        return "[grey50]○ 未載入[/grey50]"
+    if state.get("quant") != settings.quant:
+        return f"[yellow]● 已載入 {state.get('quant')} · 下次以 {settings.quant} 重載[/yellow]"
+    return "[green]● 已載入[/green]"
+
+
+def render_status_header(settings, state):
+    """常駐狀態列:模型 / 麥克風 / 關鍵設定一眼可見,隨操作即時更新。"""
+    prompt = settings.prompt.strip() if settings.prompt else ""
+    if len(prompt) > 16:
+        prompt = prompt[:16] + "…"
+    window = "單次優先" if settings.window_seconds <= 0 else f"{settings.window_seconds:g}s"
+    ts = "[green]開[/green]" if settings.with_timestamps else "[dim]關[/dim]"
+    line1 = (
+        f"[cyan]模型[/cyan] {settings.quant} · {_model_state_text(settings, state)}"
+        f"     [cyan]麥克風[/cyan] {_device_label(settings.device)}"
+    )
+    line2 = (
+        f"[cyan]分段[/cyan] {window}    "
+        f"[cyan]時間戳記[/cyan] {ts}    "
+        f"[cyan]熱詞[/cyan] {prompt or '無'}"
+    )
+    return Panel(
+        Group(line1, line2),
+        title="[bold]VibeVoice ASR[/bold]",
+        subtitle="[dim]本地語音辨識 · 模型常駐記憶體[/dim]",
+        border_style="bright_cyan",
+        box=box.ROUNDED,
+        padding=(0, 2),
+    )
+
+
+def flow_load_model(settings, state):
+    """從主畫面預先載入(或依量化變更重載)模型,讓首次辨識不必再等。"""
+    if state.get("model") is not None and state.get("quant") == settings.quant:
+        return  # 已是目前量化的模型,狀態列已顯示「已載入」,無需動作
+    processor, model = ensure_model(settings, state)
+    if model is None:
+        pause()
+        return
+    ui_success(f"模型已載入({settings.quant})。")
+    pause()
+
+
 # --------------------------------------------------------------------------- #
 # 主程式
 # --------------------------------------------------------------------------- #
@@ -1633,29 +1881,54 @@ def main():
     if not USE_RICH:
         print_app_header()
 
+    quant_order = ["4bit", "8bit", "none"]
+    cursor = 0
     try:
         while True:
+            loaded = state.get("model") is not None
+            if loaded and state.get("quant") != settings.quant:
+                model_label = "重新載入模型"
+                model_hint = f"目前 {state.get('quant')} → 改用 {settings.quant} 重載"
+            elif loaded:
+                model_label = "重新載入模型"
+                model_hint = f"已載入 {state.get('quant')}"
+            else:
+                model_label = "載入模型"
+                model_hint = f"先載入 {settings.quant}(否則首次辨識才載入)"
+
+            items = [
+                ("辨識音訊檔", "wav / mp3 / flac / m4a ..."),
+                ("麥克風錄音辨識", ""),
+                (model_label, model_hint),
+                (f"時間戳記:{'開' if settings.with_timestamps else '關'}", "Enter 切換"),
+                (f"量化模式:{settings.quant}", "Enter 循環 4bit → 8bit → none"),
+                ("其他設定", "分段 / chunk / 熱詞 / 預覽 ..."),
+                ("麥克風輸入裝置", _device_label(settings.device)),
+                ("離開", ""),
+            ]
             choice = select_menu(
-                "VibeVoice ASR",
-                [
-                    ("辨識音訊檔", "wav / mp3 / flac / m4a ..."),
-                    ("麥克風錄音辨識", ""),
-                    ("設定", "量化 / 時間戳記 / 熱詞 ..."),
-                    ("麥克風輸入裝置", ""),
-                    ("離開", ""),
-                ],
+                "主選單",
+                items,
                 subtitle="↑↓ 移動 · Enter 確認 · 數字快選 · Esc 離開",
-                header=_app_header_renderable() if USE_RICH else None,
+                start=cursor,
+                header=render_status_header(settings, state) if USE_RICH else None,
             )
-            if choice is None or choice == 4:
+            if choice is None or choice == 7:
                 break
+            cursor = choice
             if choice == 0:
                 flow_file(settings, state)
             elif choice == 1:
                 flow_record(settings, state)
             elif choice == 2:
-                settings_menu(settings)
+                flow_load_model(settings, state)
             elif choice == 3:
+                settings.with_timestamps = not settings.with_timestamps
+            elif choice == 4:
+                settings.quant = quant_order[(quant_order.index(settings.quant) + 1) % len(quant_order)]
+            elif choice == 5:
+                settings_menu(settings)
+            elif choice == 6:
                 devices_menu(settings)
     except KeyboardInterrupt:
         ui_print("\n[dim]已中斷。[/dim]")
